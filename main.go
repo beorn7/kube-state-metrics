@@ -17,17 +17,14 @@ limitations under the License.
 package main
 
 import (
-	"compress/gzip"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
 	"strconv"
-	"strings"
 
 	"github.com/golang/glog"
 	"github.com/openshift/origin/pkg/util/proc"
@@ -116,18 +113,21 @@ func main() {
 	}
 	collectorBuilder.WithKubeClient(kubeClient)
 
-	ksmMetricsRegistry := prometheus.NewRegistry()
-	ksmMetricsRegistry.Register(kcollectors.ResourcesPerScrapeMetric)
-	ksmMetricsRegistry.Register(kcollectors.ScrapeErrorTotalMetric)
-	ksmMetricsRegistry.Register(prometheus.NewProcessCollector(os.Getpid(), ""))
-	ksmMetricsRegistry.Register(prometheus.NewGoCollector())
-	go telemetryServer(ksmMetricsRegistry, opts.TelemetryHost, opts.TelemetryPort)
+	telemetryRegistry := prometheus.NewRegistry()
+	telemetryRegistry.MustRegister(
+		kcollectors.ResourcesPerScrapeMetric, kcollectors.ScrapeErrorTotalMetric,
+		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
+		prometheus.NewGoCollector(),
+	)
+	go telemetryServer(telemetryRegistry, opts.TelemetryHost, opts.TelemetryPort, opts.EnableGZIPEncoding)
 
 	collectors := collectorBuilder.Build()
+	ksmRegistry := prometheus.NewRegistry()
+	ksmRegistry.MustRegister(collectors...)
 
 	// TODO: Reenable white and blacklisting
 	// metricsServer(metrics.FilteredGatherer(registry, opts.MetricWhitelist, opts.MetricBlacklist), opts.Host, opts.Port)
-	serveMetrics(collectors, opts.Host, opts.Port)
+	serveMetrics(ksmRegistry, opts.Host, opts.Port, opts.EnableGZIPEncoding)
 }
 
 func createKubeClient(apiserver string, kubeconfig string) (clientset.Interface, error) {
@@ -160,7 +160,7 @@ func createKubeClient(apiserver string, kubeconfig string) (clientset.Interface,
 	return kubeClient, nil
 }
 
-func telemetryServer(registry prometheus.Gatherer, host string, port int) {
+func telemetryServer(registry prometheus.Gatherer, host string, port int, enableGZIPEncoding bool) {
 	// Address to listen on for web interface and telemetry
 	listenAddress := net.JoinHostPort(host, strconv.Itoa(port))
 
@@ -169,7 +169,10 @@ func telemetryServer(registry prometheus.Gatherer, host string, port int) {
 	mux := http.NewServeMux()
 
 	// Add metricsPath
-	mux.Handle(metricsPath, promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: promLogger{}}))
+	mux.Handle(metricsPath, promhttp.HandlerFor(registry, promhttp.HandlerOpts{
+		ErrorLog:           promLogger{},
+		DisableCompression: !EnableGZIPEncoding,
+	}))
 	// Add index
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
@@ -186,7 +189,7 @@ func telemetryServer(registry prometheus.Gatherer, host string, port int) {
 }
 
 // TODO: How about accepting an interface Collector instead?
-func serveMetrics(collectors []*kcollectors.Collector, host string, port int) {
+func serveMetrics(registry prometheus.Gatherer, host string, port int, EnableGZIPEncoding bool) {
 	// Address to listen on for web interface and telemetry
 	listenAddress := net.JoinHostPort(host, strconv.Itoa(port))
 
@@ -202,7 +205,10 @@ func serveMetrics(collectors []*kcollectors.Collector, host string, port int) {
 	mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
 
 	// Add metricsPath
-	mux.Handle(metricsPath, &metricHandler{collectors})
+	mux.Handle(metricsPath, promhttp.HandlerFor(registry, promhttp.HandlerOpts{
+		ErrorLog:           promLogger{},
+		DisableCompression: !EnableGZIPEncoding,
+	}))
 	// Add healthzPath
 	mux.HandleFunc(healthzPath, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -222,42 +228,4 @@ func serveMetrics(collectors []*kcollectors.Collector, host string, port int) {
              </html>`))
 	})
 	log.Fatal(http.ListenAndServe(listenAddress, mux))
-}
-
-type metricHandler struct {
-	c []*kcollectors.Collector
-}
-
-func (m *metricHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	resHeader := w.Header()
-	var writer io.Writer = w
-
-	resHeader.Set("Content-Type", `text/plain; version=`+"0.0.4")
-
-	// Gzip response if requested. Taken from
-	// github.com/prometheus/client_golang/prometheus/promhttp.decorateWriter.
-	reqHeader := r.Header.Get("Accept-Encoding")
-	parts := strings.Split(reqHeader, ",")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "gzip" || strings.HasPrefix(part, "gzip;") {
-			writer = gzip.NewWriter(writer)
-			resHeader.Set("Content-Encoding", "gzip")
-		}
-	}
-
-	for _, c := range m.c {
-		for _, m := range c.Collect() {
-			_, err := fmt.Fprint(writer, *m)
-			if err != nil {
-				// TODO: Handle panic
-				panic(err)
-			}
-		}
-	}
-
-	// In case we gziped the response, we have to close the writer.
-	if closer, ok := writer.(io.Closer); ok {
-		closer.Close()
-	}
 }

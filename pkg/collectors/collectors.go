@@ -49,11 +49,11 @@ var (
 )
 
 type store interface {
-	GetAll() []*metrics.Metric
+	GetAll() []prometheus.Metric
 }
 
-// Collector represents a kube-state-metrics metric collector. It is stripped
-// down version of the Prometheus client_golang collector.
+// Collector represents a kube-state-metrics metric collector. It implements
+// prometheus.Collector.
 type Collector struct {
 	store store
 }
@@ -62,9 +62,16 @@ func newCollector(s store) *Collector {
 	return &Collector{s}
 }
 
-// Collect returns all metrics of the underlying store of the collector.
-func (c *Collector) Collect() []*metrics.Metric {
-	return c.store.GetAll()
+// Describe implements prometheus.Collector. It yields no Descs to mark the
+// Collector as unchecked.
+func Describe(chan<- *prometheus.Desc) {}
+
+// Collect yields all metrics of the underlying store of the collector. It
+// implements prometheus.Collector.
+func (c *Collector) Collect(ch chan<- prometheus.Metric) {
+	for _, m := range c.store.GetAll() {
+		ch <- m
+	}
 }
 
 func newMetricFamilyDef(name, help string, labelKeys []string, constLabels prometheus.Labels) *metricFamilyDef {
